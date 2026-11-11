@@ -1,0 +1,194 @@
+name: Build DevWill iOS IPA (unsigned)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devwill-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EXPO_NO_TELEMETRY: "1"
+
+jobs:
+  build-ios:
+    name: Release IPA without code signing
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check TypeScript and lint
+        run: |
+          pnpm check
+          pnpm lint
+
+      - name: Select Xcode and report toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_app=""
+          for candidate in /Applications/Xcode_26.*.app; do
+            if [[ -d "$candidate/Contents/Developer" ]]; then
+              xcode_app="$candidate"
+            fi
+          done
+          if [[ -n "$xcode_app" ]]; then
+            sudo xcode-select --switch "$xcode_app/Contents/Developer"
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -F 'iOS '
+
+      - name: Generate iOS native project from Expo config
+        run: pnpm exec expo prebuild --platform ios --no-install --skip-dependency-update react-native,react
+
+      - name: Install CocoaPods dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d ios ]]; then
+            echo "::error::Expo prebuild did not create the ios directory."
+            exit 1
+          fi
+          cd ios
+          pod install --repo-update
+
+      - name: Build Release for physical iOS devices without signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace="$(find ios -maxdepth 1 -type d -name '*.xcworkspace' -print -quit)"
+          if [[ -z "$workspace" ]]; then
+            echo "::error::No .xcworkspace was generated in ios/."
+            exit 1
+          fi
+
+          schemes_json="$(xcodebuild -list -json -workspace "$workspace")"
+          scheme="$(printf '%s' "$schemes_json" | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => input += chunk);
+            process.stdin.on("end", () => {
+              const data = JSON.parse(input);
+              const schemes = data.workspace?.schemes ?? data.project?.schemes ?? [];
+              const selected = schemes.find((name) => name.toLowerCase() === "devwill") ?? schemes[0];
+              if (selected) process.stdout.write(selected);
+            });
+          ')"
+          if [[ -z "$scheme" ]]; then
+            echo "::error::Xcode did not report a build scheme for the generated workspace."
+            exit 1
+          fi
+          echo "Using workspace: $workspace"
+          echo "Using scheme: $scheme"
+
+          derived_data="$RUNNER_TEMP/devwill-derived-data"
+          build_log="$RUNNER_TEMP/devwill-xcodebuild-release.log"
+          if ! xcodebuild \
+            -workspace "$workspace" \
+            -scheme "$scheme" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build >"$build_log" 2>&1; then
+            tail -n 160 "$build_log"
+            echo "::error::Xcode Release build failed; see the Xcode output above."
+            exit 1
+          fi
+          tail -n 50 "$build_log"
+
+          product_dir="$derived_data/Build/Products/Release-iphoneos"
+          app_path="$(find "$product_dir" -maxdepth 1 -type d -name '*.app' -print -quit 2>/dev/null || true)"
+          if [[ -z "$app_path" || ! -f "$app_path/Info.plist" ]]; then
+            echo "::error::Xcode finished without producing an iOS .app in $product_dir."
+            exit 1
+          fi
+          app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Info.plist")"
+          app_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Info.plist")"
+          if [[ ! -x "$app_path/$app_executable" ]]; then
+            echo "::error::The app bundle is missing its executable: $app_executable"
+            exit 1
+          fi
+          app_archs="$(xcrun lipo -archs "$app_path/$app_executable")"
+          if [[ "$app_archs" != *arm64* ]]; then
+            echo "::error::The app executable does not contain the iOS device arm64 architecture: $app_archs"
+            exit 1
+          fi
+
+          expo_config="$RUNNER_TEMP/devwill-expo-config.json"
+          pnpm exec expo config --type public --json > "$expo_config"
+          expected_bundle_id="$(node -e 'const c = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(c.ios?.bundleIdentifier ?? "")' "$expo_config")"
+          if [[ -z "$expected_bundle_id" || "$app_bundle_id" != "$expected_bundle_id" ]]; then
+            echo "::error::Bundle identifier mismatch. Expected '$expected_bundle_id'; built '$app_bundle_id'."
+            exit 1
+          fi
+
+          package_root="$RUNNER_TEMP/devwill-ipa-package"
+          verify_root="$RUNNER_TEMP/devwill-ipa-verify"
+          ipa_path="$GITHUB_WORKSPACE/artifacts/DevWill-unsigned.ipa"
+          mkdir -p "$package_root/Payload" "$GITHUB_WORKSPACE/artifacts"
+          ditto "$app_path" "$package_root/Payload/$(basename "$app_path")"
+          (cd "$package_root" && /usr/bin/zip -qry "$ipa_path" Payload)
+
+          mkdir -p "$verify_root"
+          ditto -x -k "$ipa_path" "$verify_root"
+          packaged_app="$(find "$verify_root/Payload" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          if [[ -z "$packaged_app" || ! -f "$packaged_app/Info.plist" ]]; then
+            echo "::error::The IPA is missing Payload/<app>.app/Info.plist."
+            exit 1
+          fi
+          packaged_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$packaged_app/Info.plist")"
+          packaged_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$packaged_app/Info.plist")"
+          if [[ ! -x "$packaged_app/$packaged_executable" || "$packaged_bundle_id" != "$expected_bundle_id" ]]; then
+            echo "::error::The packaged IPA failed executable or bundle-identifier verification."
+            exit 1
+          fi
+          packaged_archs="$(xcrun lipo -archs "$packaged_app/$packaged_executable")"
+          if [[ "$packaged_archs" != *arm64* ]]; then
+            echo "::error::The packaged IPA executable is not an iOS device arm64 binary: $packaged_archs"
+            exit 1
+          fi
+          echo "IPA ready: $ipa_path"
+          echo "Bundle identifier: $packaged_bundle_id"
+          echo "Device architectures: $packaged_archs"
+          {
+            echo "### Unsigned iOS IPA built"
+            echo "- File: \`DevWill-unsigned.ipa\`"
+            echo "- Bundle ID: \`$packaged_bundle_id\`"
+            echo "- Device architecture: \`$packaged_archs\`"
+            echo "- Code signing was disabled; sign the IPA before installation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DevWill-unsigned-ios-ipa
+          path: artifacts/DevWill-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
