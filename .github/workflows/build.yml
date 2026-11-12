@@ -19,7 +19,7 @@ env:
 jobs:
   build-ios:
     name: Release IPA without code signing
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 90
 
     steps:
